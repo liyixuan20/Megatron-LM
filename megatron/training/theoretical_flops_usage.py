@@ -278,9 +278,7 @@ def build_theoretical_flops_report(
     ]
 
     computed_total = sum(entry.global_flops for entry in entries)
-    from megatron.training.training import num_floating_point_operations
-
-    reference_total_raw = num_floating_point_operations(args, global_batch_size)
+    reference_total_raw = _num_floating_point_operations_dense(args, global_batch_size)
     reference_total = int(reference_total_raw)
     if reference_total != reference_total_raw:
         raise ValueError(
@@ -607,3 +605,66 @@ def _git_context() -> tuple[str | None, bool | None]:
         return commit, dirty
     except (OSError, subprocess.CalledProcessError):
         return None, None
+
+
+def _num_floating_point_operations_dense(args: Any, batch_size: int) -> int | float:
+    """Dense Transformer FLOPs reference matching ``training.num_floating_point_operations``.
+
+    This keeps the M1 reporter testable without importing ``megatron.training.training``,
+    whose package-level imports initialize GPU/Triton-only modules.
+    """
+
+    if not getattr(args, "group_query_attention", False):
+        args.num_query_groups = args.num_attention_heads
+
+    forward_backward_expansion_factor = 3
+    fma_expansion_factor = 2
+    ffn_expansion_factor = 3 if args.swiglu else 2
+    total_real_tokens_in_batch = batch_size * args.seq_length
+    seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+
+    query_projection_size = args.kv_channels * args.num_attention_heads
+    key_projection_size = args.kv_channels * args.num_query_groups
+    value_projection_size = args.kv_channels * args.num_query_groups
+    gate_projection_size = query_projection_size if getattr(args, "attention_output_gate", False) else 0
+    standard_self_attn_term = (
+        forward_backward_expansion_factor
+        * fma_expansion_factor
+        * (
+            args.hidden_size
+            * (query_projection_size + key_projection_size + value_projection_size + gate_projection_size)
+            + query_projection_size * args.hidden_size
+        )
+    )
+    standard_self_attn_core_term = (
+        forward_backward_expansion_factor
+        * fma_expansion_factor
+        * query_projection_size
+        / 2
+        * 2
+    )
+
+    mtp_num_layers = 0 if getattr(args, "mtp_num_layers", None) is None else args.mtp_num_layers
+    num_layers = args.num_layers + mtp_num_layers
+    return (
+        total_real_tokens_in_batch
+        * (
+            forward_backward_expansion_factor
+            * fma_expansion_factor
+            * args.hidden_size
+            * args.ffn_hidden_size
+            * ffn_expansion_factor
+            * num_layers
+            + standard_self_attn_term * num_layers
+            + forward_backward_expansion_factor
+            * fma_expansion_factor
+            * mtp_num_layers
+            * (3 * args.hidden_size + 2 * args.hidden_size * args.hidden_size)
+            + forward_backward_expansion_factor
+            * fma_expansion_factor
+            * args.hidden_size
+            * args.padded_vocab_size
+            * (mtp_num_layers + 1)
+        )
+        + seqlen_squared_sum_in_batch * standard_self_attn_core_term * num_layers
+    )

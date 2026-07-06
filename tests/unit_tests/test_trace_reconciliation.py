@@ -3,18 +3,35 @@
 """Phase A tests for PyTorch profiler trace reconciliation."""
 
 import gzip
+import importlib.util
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-from megatron.training.theoretical_flops_usage import (
-    build_theoretical_flops_report,
-    write_theoretical_flops_json,
+
+def _load_module(module_name, path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_THEORETICAL_FLOPS_USAGE = _load_module(
+    "theoretical_flops_usage_for_trace_test",
+    Path("megatron/training/theoretical_flops_usage.py"),
 )
-from megatron.training.trace_reconciliation import (
-    get_torch_profile_dir,
-    parse_chrome_trace_gemm_events,
-    reconcile_trace_vs_theory,
+_TRACE_RECONCILIATION = _load_module(
+    "trace_reconciliation_for_test",
+    Path("megatron/training/trace_reconciliation.py"),
 )
+
+build_theoretical_flops_report = _THEORETICAL_FLOPS_USAGE.build_theoretical_flops_report
+write_theoretical_flops_json = _THEORETICAL_FLOPS_USAGE.write_theoretical_flops_json
+get_torch_profile_dir = _TRACE_RECONCILIATION.get_torch_profile_dir
+parse_chrome_trace_gemm_events = _TRACE_RECONCILIATION.parse_chrome_trace_gemm_events
+reconcile_trace_vs_theory = _TRACE_RECONCILIATION.reconcile_trace_vs_theory
 
 
 def _make_dense_gqa_args(**overrides):

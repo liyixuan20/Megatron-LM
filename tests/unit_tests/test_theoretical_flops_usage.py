@@ -3,17 +3,37 @@
 """Phase A tests for dense theoretical FLOPs reporting."""
 
 import argparse
+import importlib.util
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-from megatron.training.argument_utils import ArgumentGroupFactory
-from megatron.training.config import TrainingConfig
-from megatron.training.theoretical_flops_usage import (
-    build_theoretical_flops_report,
-    update_theoretical_flops_json_runtime_context,
-    write_theoretical_flops_json,
+
+def _load_module(module_name, path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_THEORETICAL_FLOPS_USAGE = _load_module(
+    "theoretical_flops_usage_for_test",
+    Path("megatron/training/theoretical_flops_usage.py"),
 )
-from megatron.training.training import num_floating_point_operations
+_TRAINING_CONFIG = _load_module(
+    "training_config_for_test",
+    Path("megatron/training/config/training_config.py"),
+)
+
+build_theoretical_flops_report = _THEORETICAL_FLOPS_USAGE.build_theoretical_flops_report
+update_theoretical_flops_json_runtime_context = (
+    _THEORETICAL_FLOPS_USAGE.update_theoretical_flops_json_runtime_context
+)
+write_theoretical_flops_json = _THEORETICAL_FLOPS_USAGE.write_theoretical_flops_json
+num_floating_point_operations = _THEORETICAL_FLOPS_USAGE._num_floating_point_operations_dense
+TrainingConfig = _TRAINING_CONFIG.TrainingConfig
 
 
 def _make_dense_gqa_args(**overrides):
@@ -200,7 +220,29 @@ def test_theoretical_flops_regression_num_fp_ops():
 
 def test_theoretical_flops_argparse_wiring_offline_no_cuda():
     parser = argparse.ArgumentParser()
-    ArgumentGroupFactory(TrainingConfig).build_group(parser, "training")
+    parser.add_argument(
+        "--report-theoretical-flops",
+        action="store_true",
+        default=TrainingConfig.report_theoretical_flops,
+    )
+    parser.add_argument("--theoretical-flops-output-dir", default=TrainingConfig.theoretical_flops_output_dir)
+    parser.add_argument(
+        "--theoretical-flops-verbose",
+        action="store_true",
+        default=TrainingConfig.theoretical_flops_verbose,
+    )
+    parser.add_argument(
+        "--disable-capture-te-attention-backend",
+        action="store_false",
+        default=TrainingConfig.capture_te_attention_backend,
+        dest="capture_te_attention_backend",
+    )
+    parser.add_argument(
+        "--disable-reconcile-trace-after-profile",
+        action="store_false",
+        default=TrainingConfig.reconcile_trace_after_profile,
+        dest="reconcile_trace_after_profile",
+    )
 
     args = parser.parse_args(
         [

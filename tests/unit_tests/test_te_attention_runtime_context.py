@@ -2,14 +2,29 @@
 
 """Phase A tests for TE attention runtime-context parsing."""
 
+import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from megatron.training.theoretical_flops_usage import (
-    build_runtime_context,
-    parse_te_attention_runtime_context,
-    set_te_attention_debug_env_if_needed,
+
+def _load_theoretical_flops_usage():
+    spec = importlib.util.spec_from_file_location(
+        "theoretical_flops_usage_for_te_test",
+        Path("megatron/training/theoretical_flops_usage.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_THEORETICAL_FLOPS_USAGE = _load_theoretical_flops_usage()
+build_runtime_context = _THEORETICAL_FLOPS_USAGE.build_runtime_context
+parse_te_attention_runtime_context = (
+    _THEORETICAL_FLOPS_USAGE.parse_te_attention_runtime_context
 )
+set_te_attention_debug_env_if_needed = _THEORETICAL_FLOPS_USAGE.set_te_attention_debug_env_if_needed
 
 
 def test_te_attention_runtime_context_parse():
