@@ -1,8 +1,12 @@
 # Theoretical FLOPs Report + Runtime Trace Reconciliation
 
-**Status:** Draft / preliminary design  
+**Status:** Draft / preliminary design; M1/M2 Phase A implemented and server-validated
 **Author:** (internal working doc)  
-**Last updated:** 2026-07-06 (rev. 7 — Phase A scope, TE env timing, capture flag, reconciliation per-rank)
+**Last updated:** 2026-09-16 (rev. 9 — link JA operational runbook)
+
+Operational commands, Git synchronization, Docker access, and acceptance checks are in
+`THEORETICAL_FLOPS_TRACE_INSTRUCTIONS.md`. Use that runbook when an older inline command
+in this design document differs from the current JA cluster procedure.
 
 This document describes a plan to add **operator-level theoretical FLOPs reporting**
 integrated into the Megatron training loop (Option B), together with **runtime trace
@@ -16,6 +20,44 @@ compared against the analytical model.
 - Target servers do **not** need Codex CLI, Cursor, or any agent runtime. Implementation
   and iteration happen **locally**; the server is used only for **manual** phase **C**
   smoke validation (§6.1, §11.1).
+- Current target cluster is JA. The login/head node is `yes`; the 8×A100 compute node is
+  `octave` (`Gres=gpu:a100:8`). Submit GPU jobs through SLURM; do not run training on
+  `yes` directly.
+- Project source, SLURM scripts, logs, and output artifacts live in the shared worktree
+  under the user's home/workspace on `yes` (for example
+  `/home/liyixuan/workspace/Megatron-LM`). The actual Docker container process runs on
+  the allocated compute node (`octave`) and bind-mounts that shared worktree.
+- Docker image layers/cache are managed by the Docker daemon on the node where `docker run`
+  executes. In practice, the first SLURM job on `octave` may need to pull
+  `nvcr.io/nvidia/pytorch:26.04-py3` on `octave`; the repository itself is **not** copied
+  into the image.
+- Source edits happen in local WSL, then are committed and pushed to the user's fork. The
+  server worktree pulls the same branch before tests. Server-side edits are discouraged
+  except for temporary diagnostics.
+
+### 0.1 Current Objective And Scope (2026-08)
+
+The immediate objective is to run an **8×A100 Megatron-LM validation on `octave`** that
+produces:
+
+1. Per-operator theoretical shape and FLOPs records from the Megatron run configuration.
+2. A complete PyTorch profiler Chrome trace backup under `flops_analysis/torch_profile/`.
+3. Reconciliation JSON/text summaries suitable for comparing Megatron's observed kernel
+   shapes/FLOPs against simulator-generated data.
+
+Dense and MoE validation must be separated:
+
+- **Dense path:** current M1/M2 scope. Run and validate first.
+- **MoE path:** not part of the current executable smoke until the simulator-side MoE
+  architecture is ready. MoE grouped-GEMM analytical breakdown belongs to M3 and should use
+  a separate script/config from the dense smoke.
+
+Current implementation status:
+
+- M1/M2 code exists on branch `codex/theoretical-flops-trace`.
+- M1/M2 Phase A targeted pytest has passed on the server using offline/light imports.
+- M1/M2 Phase C on real 8×A100 Docker/SLURM has not yet been completed.
+- M3 (MLA, MoE grouped GEMM, MTP, THD, PP-stage filtering) has not been implemented.
 
 ---
 
@@ -539,6 +581,24 @@ CUDA profiler API. For this plan, always pass **both** `--profile` and
 tests locally first (§11.1), then sync the verified commit to the server and run the packaged
 script manually.
 
+#### JA `yes` / `octave` Operating Model
+
+- Login/editing node: `yes`. Store the repository, SLURM files, logs, and
+  `flops_analysis/` artifacts in the shared worktree, e.g.
+  `/home/liyixuan/workspace/Megatron-LM`.
+- Compute node: `octave`. Request `--partition=a100` and `--gpus=a100:8` (or
+  `--gres=gpu:a100:8` if the local SLURM syntax requires it).
+- Docker runs inside the SLURM allocation on `octave`, not as a long-running service on
+  `yes`. The Docker command bind-mounts the shared worktree into the container.
+- Docker image: `nvcr.io/nvidia/pytorch:26.04-py3` from `docker/.ngc_version.dev`.
+  If it is not cached on `octave`, the first job may spend time pulling it.
+- Use Git as the source-of-truth sync mechanism: local WSL edits -> commit -> push to fork
+  -> server `git pull --ff-only` -> submit SLURM job. Do not manually edit the server copy
+  except for temporary diagnostics.
+- Dense and MoE jobs must use separate scripts/configs. The dense script below is the
+  current M1/M2 validation entrypoint; MoE validation waits for M3 and simulator MoE
+  readiness.
+
 Use `--num-layers 4` first (per-layer shapes identical to 28-layer model; per-layer FLOPs
 scale linearly with `num_layers`, while total FLOPs also include a fixed logits/output-head
 term). After smoke passes, change to `--num-layers 28`.
@@ -573,6 +633,27 @@ Optional SLURM: `scripts/run_theoretical_flops_trace_slurm.slurm` wraps the same
 **Code sync:** server must run the **same commit** validated locally (git branch/push,
 `git format-patch`, `rsync`, or equivalent). Record the commit SHA in smoke notes or
 `flops_analysis/theoretical_flops.json` `runtime_context` when convenient.
+
+Recommended sync loop for this project:
+
+```bash
+# Local WSL
+cd /home/duckie/workspace/Megatron-LM
+git switch codex/theoretical-flops-trace
+git status
+git add <changed-files>
+git commit -S -s -m "<message>"
+git push fork codex/theoretical-flops-trace
+
+# Server login node yes
+cd /home/liyixuan/workspace/Megatron-LM
+git switch codex/theoretical-flops-trace
+git pull --ff-only
+git log --oneline -1
+```
+
+If `-S` commit signing is not configured on local WSL, use `-s` for internal testing, but
+restore signed commits before opening an upstream PR. The server should not push changes.
 
 #### Inline recipes (reference for the script body)
 
@@ -698,12 +779,15 @@ Notes:
 
 ### 6.2 Artifacts
 
-| Artifact | Producer | Location |
-|----------|----------|----------|
-| `theoretical_flops.json` | new reporter | `flops_analysis/` |
-| `torch_profile/rank-*.json.gz` | pytorch profiler `trace_handler` | `flops_analysis/torch_profile/` |
-| `reconciliation_rank{R}.json` | new reconciler (per profile rank) | `flops_analysis/` |
-| `reconciliation.json` | optional rank-0 summary aggregator | `flops_analysis/` |
+| Artifact | Producer | Location | Purpose |
+|----------|----------|----------|---------|
+| `theoretical_flops.json` | new reporter | `flops_analysis/` | Structured theoretical operator shapes/FLOPs for simulator comparison |
+| `torch_profile/rank-*.json.gz` | pytorch profiler `trace_handler` | `flops_analysis/torch_profile/` | Full Chrome trace backup for later inspection/replay |
+| `reconciliation_rank{R}.json` | new reconciler (per profile rank) | `flops_analysis/` | Per-rank match/unmatch and FLOPs-budget summary |
+| `reconciliation.json` | optional rank-0 summary aggregator | `flops_analysis/` | Optional aggregate summary |
+
+Do not delete the Chrome trace after reconciliation. The trace is the backup artifact used
+when simulator/Megatron disagreements require manual kernel-shape inspection.
 
 ---
 
@@ -853,6 +937,10 @@ after sync (§11.1). Each milestone is independently testable.
 - [ ] MTP preamble + extra transformer layer
 - [ ] THD: consume `seqlen_squared_sum` / `total_real_tokens` from training accumulators
 - [ ] Per-PP-stage filtering via `pipeline_model_parallel_layout`
+
+Dense and MoE validation should remain separate in M3. Do not extend the dense smoke script
+in-place with MoE flags. Add a dedicated MoE script/config once the simulator-side MoE
+architecture is ready, so dense regressions remain easy to isolate.
 
 ---
 
