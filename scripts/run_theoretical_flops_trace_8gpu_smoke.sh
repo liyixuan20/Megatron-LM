@@ -8,10 +8,30 @@ if [[ "${MODE}" != "m1" && "${MODE}" != "m1m2" ]]; then
   exit 2
 fi
 
-if ! python pretrain_gpt.py --help 2>/dev/null | grep -q -- "--report-theoretical-flops"; then
-  echo "pretrain_gpt.py --help does not contain --report-theoretical-flops; check the synced commit." >&2
+if ! command -v python >/dev/null 2>&1; then
+  echo "python is not on PATH. PATH=${PATH}" >&2
   exit 1
 fi
+
+# Do not pipe `pretrain_gpt.py --help` into `grep -q` under `set -o pipefail`.
+# Megatron's help text is huge; grep -q exits on the first match and python then
+# dies with SIGPIPE (141), so the old check failed even when the flag existed.
+python - <<'PY'
+import argparse
+import sys
+
+from megatron.training.arguments import add_megatron_arguments
+
+parser = argparse.ArgumentParser(add_help=False)
+add_megatron_arguments(parser)
+flags = {opt for action in parser._actions for opt in action.option_strings}
+if "--report-theoretical-flops" not in flags:
+    sys.stderr.write(
+        "argparse is missing --report-theoretical-flops; check the synced commit.\n"
+    )
+    sys.exit(1)
+print("preflight_ok --report-theoretical-flops")
+PY
 
 export NVTE_DEBUG="${NVTE_DEBUG:-1}"
 export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
