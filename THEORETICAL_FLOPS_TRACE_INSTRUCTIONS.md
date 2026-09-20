@@ -25,7 +25,10 @@ Dense and MoE are separate tracks. Do not add MoE flags to the Dense smoke scrip
 | M2 trace export and reconciliation | Implemented | Commit `06a5f407f` |
 | Offline/lightweight Phase A fixes | Implemented | Commit `5defc03ad` |
 | M1/M2 Phase A targeted pytest | Passed previously on server | Re-run in the Docker image before Phase C |
-| M1/M2 Phase C, 8 A100 | Not run yet | Run `m1`, then `m1m2` on `octave` |
+| 1-GPU Docker probe | Passed | Job `316935`, `DOCKER_PROBE_OK` |
+| 8-GPU Phase C, job `316937` | Failed in 44s | Smoke `--help` preflight; training never started |
+| 1-GPU `--help` debug, job `316981` | Completed | `KeyError: getpwuid(): uid not found: 18107` while importing TE/torch inductor. Container `--user` has no `/etc/passwd` entry. Fix: set `USER`/`LOGNAME` in `scripts/theoretical_flops_slurm_common.sh` |
+| M1/M2 Phase C, 8 A100 | Not run yet | After the `USER` env fix, `sbatch scripts/run_theoretical_flops_trace_slurm.slurm` |
 | M3 MLA/MoE/MTP/THD/PP filtering | Not implemented | Start only after Dense Phase C is understood |
 | MoE simulator comparison | Deferred | Simulator-side MoE architecture is not ready |
 
@@ -155,19 +158,101 @@ refresh an already existing login session. In the observed working sequence, an 
 SLURM allocation on `octave` is created first, and a new `ssh octave` session is opened
 afterward. That new session sees the Docker group.
 
-Keep the allocation alive for the entire Docker operation. Closing the SSH session does
-not release the allocation; cancel it explicitly when finished.
+**Unattended runs must use `sbatch`, not `srun sleep infinity`.** Holder jobs expire
+when `--time` elapses if you go offline. Batch processes on JA do not start in the
+`docker` group; every wrapper re-execs under `sg docker`. Interactive `ssh octave`
+after an allocation still works for debugging, but it is not the Phase C path.
 
-This SSH-after-allocation sequence documents the cluster behavior that has been observed
-to work; it is not a way to bypass SLURM. The allocation must reserve every GPU used by
-the container. If the administrator requires Docker itself to run as an `srun`/`sbatch`
-job step for cgroup accounting, use that site-approved wrapper while keeping the same
-image, mount, and commands below.
+### 4.1 Queued sbatch catalog (preferred)
 
-### 4.1 Terminal A on `yes`: create a 1-GPU access allocation
+Submit from `yes` in `/home/liyixuan/workspace/Megatron-LM`. Create `logs/` first.
+The 8-GPU wrapper refuses a dirty worktree; commit before Phase C.
 
-Use this only for Docker permission checks, pulling/building the image, and Phase A CPU
-tests. It does not authorize an 8-GPU training run.
+| Job | Script | GPUs | Time | What it proves |
+|---|---|---:|---|---|
+| Docker probe | `scripts/probe_theoretical_flops_docker_slurm.slurm` | 1 | 10 min | `sg docker`, image present, `import torch` |
+| `--help` debug | `scripts/debug_theoretical_flops_help_slurm.slurm` | 1 | 15 min | argparse flag + real `pretrain_gpt.py --help` stderr |
+| Image + Phase A | `scripts/prepare_theoretical_flops_image_slurm.slurm` | 1 | 60 min | Build/reuse `megatron-lm:theoretical-flops-dev`, CPU pytest |
+| Dense Phase C | `scripts/run_theoretical_flops_trace_slurm.slurm` | **8** | 60 min | `m1` then `m1m2`; never pulls/builds the image |
+
+```bash
+cd /home/liyixuan/workspace/Megatron-LM
+mkdir -p logs
+git status --short
+git log -1 --oneline
+squeue -u "$USER" -o "%.18i %.16j %.9P %.8T %.10M %.6D %R"
+
+# 1) Docker-in-batch (skip if a recent probe already printed DOCKER_PROBE_OK)
+PROBE_JOB_ID=$(sbatch --parsable scripts/probe_theoretical_flops_docker_slurm.slurm)
+echo "PROBE_JOB_ID=${PROBE_JOB_ID}"
+
+# 2) Optional: argparse / --help with stderr visible (1 GPU, not 8)
+DEBUG_JOB_ID=$(sbatch --parsable scripts/debug_theoretical_flops_help_slurm.slurm)
+echo "DEBUG_JOB_ID=${DEBUG_JOB_ID}"
+
+# 3) Only if the image is missing or docker/uv.lock changed
+# PREP_JOB_ID=$(sbatch --parsable scripts/prepare_theoretical_flops_image_slurm.slurm)
+# sbatch --export=ALL,FORCE_IMAGE_BUILD=1 \
+#   scripts/prepare_theoretical_flops_image_slurm.slurm
+
+# 4) Phase C. Queue behind a successful 1-GPU debug so a failed import
+#    cancels the 8-GPU job instead of occupying octave after hours of PD.
+sbatch --dependency=afterok:${DEBUG_JOB_ID} \
+  scripts/run_theoretical_flops_trace_slurm.slurm
+```
+
+`sbatch` without `--dependency` is fine if the 1-GPU jobs already completed
+successfully and the worktree SHA matches the intended run.
+
+Do **not** run `scripts/run_theoretical_flops_trace_8gpu_smoke.sh` under a 1-GPU
+allocation. It is hard-coded to `--nproc-per-node 8`. `docker run --gpus all`
+can also ignore SLURM's `CUDA_VISIBLE_DEVICES` (job `316935` allocated 1 GPU
+and still saw `torch.cuda.device_count() == 8` inside the container).
+
+### 4.2 Inspecting job output
+
+From `yes` (NFS, so `octave` logs are visible immediately):
+
+```bash
+cd /home/liyixuan/workspace/Megatron-LM
+
+# Queue / completion
+squeue -u "$USER" -o "%.18i %.16j %.9P %.8T %.10M %.6D %R"
+sacct -j <jobid> --format=JobID,JobName,State,ExitCode,Elapsed,NodeList -P
+
+# SLURM stdout/stderr. nvidia-smi -q makes 8-GPU .out files huge; use tail.
+tail -n 80 logs/flops-docker-probe-<jobid>.out
+tail -n 80 logs/flops-help-debug-<jobid>.out
+tail -n 80 logs/flops-dense-8gpu-<jobid>.out
+
+# Phase C artifacts (created only after m1 starts writing JSON)
+ls -ld runs/theoretical-flops/*
+ls -la runs/theoretical-flops/<tag>/
+cat runs/theoretical-flops/<tag>/m1-exit-status.txt
+grep -E 'THEORETICAL FLOPS REPORT|TE ATTENTION BACKEND|TRACE RECONCILIATION|Traceback|getpwuid|preflight_ok' \
+  runs/theoretical-flops/<tag>/m1.log \
+  runs/theoretical-flops/<tag>/m1m2.log \
+  logs/flops-dense-8gpu-<jobid>.out
+```
+
+A job leaving `squeue` is not success. Trust `sacct` `COMPLETED` / `0:0` plus
+the artifacts above. Job `316937` was `FAILED` / `1:0` after 44s with no
+`theoretical_flops.json`.
+
+| File | Success marker |
+|---|---|
+| `logs/flops-docker-probe-*.out` | `DOCKER_PROBE_OK` |
+| `logs/flops-help-debug-*.out` | `has_flag True`, `help_exit=0` |
+| `logs/flops-image-prepare-*.out` | `PREP_ROOT=...` and pytest passed |
+| `logs/flops-dense-8gpu-*.out` | `RUN_ROOT=...` and both smokes exit 0 |
+| `runs/theoretical-flops/<tag>/m1/theoretical_flops.json` | non-empty |
+| `runs/theoretical-flops/<tag>/m1m2/torch_profile/rank-0.json.gz` | `gzip -t` passes |
+| `runs/theoretical-flops/<tag>/m1m2/reconciliation_rank0.json` | parser succeeded |
+
+### 4.3 Optional interactive holders (legacy)
+
+Use this only when you are at the keyboard and need an interactive `ssh octave`
+shell. It is not the Phase C path.
 
 ```bash
 srun -A a100 -p a100 \
@@ -179,11 +264,7 @@ srun -A a100 -p a100 \
   sleep infinity
 ```
 
-This command intentionally occupies Terminal A. If the site-provided command is
-`infinite sleep` rather than `sleep infinity`, keep using the site-provided form that has
-already been verified.
-
-### 4.2 Terminal B on `yes`: verify allocation, then enter `octave`
+Then from a second terminal:
 
 ```bash
 squeue -u "$USER" -o "%.18i %.12j %.9P %.8T %.10M %.6D %R"
@@ -196,30 +277,14 @@ docker version
 docker info | grep -i -E 'runtime|nvidia|root dir|storage'
 ```
 
-Expected results:
+Expected: `hostname` is `octave`, `id` includes `docker`, `docker version`
+shows client and server, NVIDIA runtime is present. If the socket is still
+denied, record those outputs and ask the administrator. Do not use `sudo`.
 
-- `hostname` prints `octave`.
-- `id` includes the `docker` group.
-- `docker version` shows both client and server sections without `permission denied`.
-- Docker reports an NVIDIA-capable runtime.
-
-If `id` contains `docker` but the socket is still denied, record all five outputs above
-and ask the cluster administrator. Do not use `sudo`, copy private keys, or loosen
-`/var/run/docker.sock` permissions.
-
-### 4.3 Formal 8-GPU allocation
-
-End the 1-GPU access job before requesting all GPUs. From `yes`, find and cancel only the
-access job:
+Cancel the 1-GPU holder before requesting 8 GPUs interactively:
 
 ```bash
-squeue -u "$USER" -o "%.18i %.12j %.9P %.8T %R"
 scancel <flops-docker-access-job-id>
-```
-
-Then, in Terminal A on `yes`, request all 8 A100s:
-
-```bash
 srun -A a100 -p a100 \
   --nodes=1 --ntasks=1 \
   --gres=gpu:a100:8 \
@@ -229,17 +294,9 @@ srun -A a100 -p a100 \
   sleep infinity
 ```
 
-Wait until `squeue` shows `R` and `octave`. Only then open a new session from Terminal B:
-
-```bash
-squeue -u "$USER" -o "%.18i %.12j %.9P %.8T %.10M %.6D %R"
-ssh octave
-id
-nvidia-smi
-```
-
-Do not launch `docker run --gpus all` while holding only the 1-GPU access allocation.
-The 8-GPU job may wait in `PD` until all GPUs are available; that is expected.
+Wait until `squeue` shows `R` on `octave`, then `ssh octave` and `nvidia-smi`.
+Do not `docker run --gpus all` on the 1-GPU holder. `PD` for an 8-GPU job is
+expected while octave is busy.
 
 ## 5. Build The Reproducible Docker Image
 
@@ -252,38 +309,12 @@ The image only needs rebuilding when `docker/`, `pyproject.toml`, or `uv.lock` c
 Ordinary Python/shell source updates are visible through the bind mount and do not need an
 image rebuild.
 
-For queued operation, **do not use `srun sleep infinity`**. That holder expires
-after `--time` if you go offline. Use `sbatch` so the job waits in the queue
-unattended. SLURM batch processes on JA do not start with the `docker` group;
-the wrappers re-exec under `sg docker`.
+For queued operation, **do not use `srun sleep infinity`**. Submit the wrappers in
+§4.1. The image is already on `octave` from the earlier build; skip the 1-GPU
+prep job unless the image is missing or `docker/` / `uv.lock` changed.
 
-Validate that path with a 1-GPU, 10-minute probe (no clean-worktree requirement).
-The image is already on `octave` from the interactive build, so skip the 1-GPU
-prep job unless the image is missing:
-
-```bash
-cd /home/liyixuan/workspace/Megatron-LM
-mkdir -p logs
-squeue -u "$USER"
-# Cancel leftover flops holder/smoke jobs before submitting a new probe.
-# scancel <jobid>
-
-PROBE_JOB_ID=$(sbatch --parsable scripts/probe_theoretical_flops_docker_slurm.slurm)
-echo "PROBE_JOB_ID=${PROBE_JOB_ID}"
-```
-
-When `sacct -j "$PROBE_JOB_ID"` is `COMPLETED` / `0:0` and
-`logs/flops-docker-probe-${PROBE_JOB_ID}.out` contains `DOCKER_PROBE_OK`, submit
-the 8-GPU smoke (worktree must be clean / committed):
-
-```bash
-sbatch scripts/run_theoretical_flops_trace_slurm.slurm
-```
-
-Use `--export=ALL,FORCE_IMAGE_BUILD=1` only when submitting
-`scripts/prepare_theoretical_flops_image_slurm.slurm` to force a rebuild. The
-8-GPU job never pulls or builds images. `ALLOW_UNVERIFIED_IMAGE=1` is a
-diagnostic escape hatch and should not be used for acceptance runs.
+`ALLOW_UNVERIFIED_IMAGE=1` is a diagnostic escape hatch and should not be used
+for acceptance runs. The 8-GPU job never pulls or builds images.
 
 `Dockerfile.ci.dev` copies `assets/`; the public clone does not contain that
 directory. The prep script runs `mkdir -p assets` before `docker build`. Do not
@@ -338,6 +369,10 @@ docker run --rm --gpus all \
   bash -lc 'python -c "import torch; print(torch.__version__); print(torch.cuda.device_count()); assert torch.cuda.device_count() == 8" && nvidia-smi -L'
 ```
 
+Interactive `docker run` as root does not hit the `getpwuid` bug. Batch wrappers
+run `--user $(id -u)` and **must** set `USER`/`LOGNAME` via
+`set_host_user_docker_opts` (job `316981`).
+
 Re-run the targeted Phase A suite in the same image. `--noconftest` is deliberate: these
 three tests use lightweight imports and must not load the repository-wide GPU/Triton
 fixtures.
@@ -366,12 +401,10 @@ The packaged entrypoint is:
 scripts/run_theoretical_flops_trace_8gpu_smoke.sh
 ```
 
-The queued SLURM wrappers are:
+The queued SLURM wrappers are listed in §4.1. Phase C is only:
 
 ```text
-scripts/probe_theoretical_flops_docker_slurm.slurm   # 1 GPU, ~2 min: sg docker + image
-scripts/prepare_theoretical_flops_image_slurm.slurm  # 1 GPU: image + Phase A
-scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: Phase C only
+scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: m1 then m1m2
 ```
 
 It has two modes:
@@ -496,15 +529,10 @@ which is the intended comparison basis for the simulator.
 
 ## 8. Finish The Allocation And Report Results
 
-From the `octave` session, print a compact result summary before exiting:
+If Phase C was launched with `sbatch`, there is no holder to cancel; the job
+exits on its own. Inspect with the commands in §4.2.
 
-```bash
-du -sh "$RUN_ROOT"
-find "$RUN_ROOT" -maxdepth 3 -type f -printf '%p\t%s bytes\n' | sort
-exit
-```
-
-On `yes`, identify and cancel only the 8-GPU holder job:
+If you used a legacy `srun sleep infinity` holder, cancel only that job:
 
 ```bash
 squeue -u "$USER" -o "%.18i %.12j %.9P %.8T %R"
@@ -538,6 +566,8 @@ Use the first real failure, not later cascading NCCL errors.
 |---|---|
 | Docker permission denied | Batch jobs lack the docker group until `sg docker`; check `logs/*.err` for the sg re-exec. Confirm `id` inside the job includes docker after sg. Do not use `srun sleep` holders. |
 | `docker: command not found` | Confirm hostname is `octave`, not `yes` |
+| `getpwuid(): uid not found` | Container `--user` UID is missing from image `/etc/passwd`. Torch inductor needs `USER`/`LOGNAME` (see `set_host_user_docker_opts`). Job `316981`. |
+| `pretrain_gpt.py --help does not contain --report-theoretical-flops` | Often a swallowed import error (was `getpwuid`) or `pipefail`+`grep -q` SIGPIPE. Do not treat as "flag missing" until stderr is visible. |
 | Image pull/build fails | Preserve build output; check registry/network and disk with `docker system df`; do not prune without review |
 | `uv` or package import mismatch | Confirm image tag and ID; rebuild from `docker/Dockerfile.ci.dev --target main` after lock/dependency changes |
 | Fewer than 8 GPUs in container | Confirm the formal 8-GPU allocation is `R`; stop rather than train on an incomplete allocation |

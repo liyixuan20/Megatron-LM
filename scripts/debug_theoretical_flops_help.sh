@@ -5,8 +5,11 @@
 set -u
 
 echo "PATH=${PATH}"
+echo "USER=${USER:-}"
+echo "LOGNAME=${LOGNAME:-}"
 echo "which python: $(command -v python || true)"
 python -V
+python -c 'import getpass; print("getpass.getuser()", getpass.getuser())' || true
 
 echo "==== argparse flag check ===="
 set +e

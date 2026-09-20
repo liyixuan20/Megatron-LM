@@ -37,11 +37,20 @@ require_docker() {
 
 # Flags for bind-mounting the shared NFS home: run as the submitting user so
 # root_squash cannot block writes, and skip uv editable installs.
+#
+# The CI image has no /etc/passwd entry for cluster UIDs. Torch inductor calls
+# getpass.getuser() while importing Transformer Engine; without USER/LOGNAME
+# that becomes KeyError: getpwuid(): uid not found. Seen on job 316981.
 set_host_user_docker_opts() {
+  local host_user
+  host_user="$(id -un 2>/dev/null || echo megatron)"
   HOST_USER_DOCKER_OPTS=(
     --user "$(id -u):$(id -g)"
     --entrypoint bash
     -e HOME=/tmp
+    -e USER="$host_user"
+    -e LOGNAME="$host_user"
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
     -e PYTHONPATH=/workspace/Megatron-LM
     -e UV_NO_SYNC=1
     -e PYTHONDONTWRITEBYTECODE=1
