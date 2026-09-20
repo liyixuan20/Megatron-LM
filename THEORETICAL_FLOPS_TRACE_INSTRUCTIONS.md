@@ -252,18 +252,45 @@ The image only needs rebuilding when `docker/`, `pyproject.toml`, or `uv.lock` c
 Ordinary Python/shell source updates are visible through the bind mount and do not need an
 image rebuild.
 
+For queued operation, use the dedicated 1-GPU preparation job. It builds or reuses the
+node-local image, verifies its build-input fingerprint, and runs Phase A before the 8-GPU
+job becomes eligible:
+
+```bash
+cd /home/liyixuan/workspace/Megatron-LM
+mkdir -p logs
+
+PREP_JOB_ID=$(sbatch --parsable scripts/prepare_theoretical_flops_image_slurm.slurm)
+RUN_JOB_ID=$(sbatch --parsable \
+  --dependency="afterok:${PREP_JOB_ID}" \
+  scripts/run_theoretical_flops_trace_slurm.slurm)
+
+echo "PREP_JOB_ID=${PREP_JOB_ID}"
+echo "RUN_JOB_ID=${RUN_JOB_ID}"
+```
+
+Use `--export=ALL,FORCE_IMAGE_BUILD=1` when submitting the preparation job to force a
+rebuild. The 8-GPU job never pulls or builds images: a missing, unlabeled, or stale image
+fails fast and points back to the preparation job. `ALLOW_UNVERIFIED_IMAGE=1` is available
+only as an explicit diagnostic escape hatch and should not be used for acceptance runs.
+
 On `octave`, inside an active allocation:
 
 ```bash
 cd /home/liyixuan/workspace/Megatron-LM
 MEGATRON_IMAGE=megatron-lm:theoretical-flops-dev
 MEGATRON_BASE_IMAGE=$(<docker/.ngc_version.dev)
+IMAGE_INPUT_SHA=$(git ls-files -s \
+  assets docker README.md pyproject.toml uv.lock \
+  megatron/core/__init__.py megatron/core/package_info.py \
+  | sha256sum | awk '{print $1}')
 
 docker pull "$MEGATRON_BASE_IMAGE"
 docker build \
   --target main \
   --build-arg FROM_IMAGE_NAME="$MEGATRON_BASE_IMAGE" \
   --build-arg IMAGE_TYPE=dev \
+  --label "org.megatron.build-input-sha=$IMAGE_INPUT_SHA" \
   -f docker/Dockerfile.ci.dev \
   -t "$MEGATRON_IMAGE" \
   .
@@ -322,6 +349,13 @@ The packaged entrypoint is:
 
 ```text
 scripts/run_theoretical_flops_trace_8gpu_smoke.sh
+```
+
+The queued SLURM wrappers are:
+
+```text
+scripts/prepare_theoretical_flops_image_slurm.slurm  # 1 GPU: image + Phase A
+scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: Phase C only
 ```
 
 It has two modes:

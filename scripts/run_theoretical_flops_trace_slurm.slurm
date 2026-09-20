@@ -2,6 +2,7 @@
 #SBATCH --job-name=flops-dense-8gpu
 #SBATCH --account=a100
 #SBATCH --partition=a100
+#SBATCH --nodelist=octave
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -12,21 +13,22 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-# Dense 8xA100 Phase C: prepare the CI image if its inputs changed, then run
-# the M1 and M1+M2 smoke tests. Submit from the shared worktree on yes:
+# Dense 8xA100 Phase C: consume a previously prepared CI image, then run the
+# M1 and M1+M2 smoke tests. Submit from the shared worktree on yes:
 #
 #   mkdir -p logs
-#   sbatch --test-only scripts/run_theoretical_flops_trace_slurm.slurm
-#   sbatch scripts/run_theoretical_flops_trace_slurm.slurm
+#   PREP_JOB_ID=$(sbatch --parsable scripts/prepare_theoretical_flops_image_slurm.slurm)
+#   sbatch --dependency="afterok:${PREP_JOB_ID}" scripts/run_theoretical_flops_trace_slurm.slurm
 #
 # The liyixuan user is associated with the a100 account. The JA a100 partition
-# provides the 8xA100 octave node, so an explicit nodelist is unnecessary.
+# provides the 8xA100 octave node. This job never pulls or builds an image.
 
 set -euo pipefail
 
 readonly MEGATRON_REPO=/home/liyixuan/workspace/Megatron-LM
 readonly MEGATRON_IMAGE=megatron-lm:theoretical-flops-dev
 readonly EXPECTED_BRANCH=codex/theoretical-flops-trace
+readonly CONTAINER_CACHE=/home/liyixuan/.cache/megatron-docker
 
 cd "$MEGATRON_REPO"
 
@@ -73,7 +75,6 @@ if ! docker version >/dev/null 2>&1; then
   exit 1
 fi
 
-megatron_base_image=$(<docker/.ngc_version.dev)
 image_input_sha=$(
   git ls-files -s \
     assets docker README.md pyproject.toml uv.lock \
@@ -81,33 +82,68 @@ image_input_sha=$(
     | sha256sum \
     | awk '{print $1}'
 )
+
+if ! docker image inspect "$MEGATRON_IMAGE" >/dev/null 2>&1; then
+  echo "Image $MEGATRON_IMAGE is missing on octave." >&2
+  echo "Run scripts/prepare_theoretical_flops_image_slurm.slurm first." >&2
+  exit 1
+fi
+
 existing_input_sha=$(
   docker image inspect "$MEGATRON_IMAGE" \
     --format '{{index .Config.Labels "org.megatron.build-input-sha"}}' \
     2>/dev/null || true
 )
 
-echo "base image: $megatron_base_image"
-echo "image input sha: $image_input_sha"
+allow_unverified_image=${ALLOW_UNVERIFIED_IMAGE:-0}
+if [[ "$allow_unverified_image" != "0" && "$allow_unverified_image" != "1" ]]; then
+  echo "ALLOW_UNVERIFIED_IMAGE must be 0 or 1, got: $allow_unverified_image" >&2
+  exit 2
+fi
 
+echo "expected image input sha: $image_input_sha"
+echo "existing image input sha: ${existing_input_sha:-missing}"
 if [[ "$existing_input_sha" != "$image_input_sha" ]]; then
-  echo "CI image is missing or stale; pulling the base image and rebuilding."
-  docker pull "$megatron_base_image" 2>&1 | tee "$run_root/docker-pull.log"
-  docker build \
-    --target main \
-    --build-arg FROM_IMAGE_NAME="$megatron_base_image" \
-    --build-arg IMAGE_TYPE=dev \
-    --label "org.megatron.build-input-sha=$image_input_sha" \
-    -f docker/Dockerfile.ci.dev \
-    -t "$MEGATRON_IMAGE" \
-    . 2>&1 | tee "$run_root/docker-build.log"
-else
-  echo "Reusing $MEGATRON_IMAGE; Docker build inputs are unchanged."
+  if [[ "$allow_unverified_image" != "1" ]]; then
+    echo "Image $MEGATRON_IMAGE is stale or has no build-input label." >&2
+    echo "Run the 1-GPU preparation job; this 8-GPU job will not rebuild it." >&2
+    exit 1
+  fi
+  echo "WARNING: using an unverified image because ALLOW_UNVERIFIED_IMAGE=1." >&2
 fi
 
 docker image inspect "$MEGATRON_IMAGE" \
-  --format '{{json .RepoDigests}} {{.Id}} {{.Created}}' \
+  --format '{{json .RepoDigests}} {{.Id}} {{.Created}} {{index .Config.Labels "org.megatron.build-input-sha"}}' \
   | tee "$run_root/docker-image.txt"
+printf '%s\n' "$image_input_sha" | tee "$run_root/image-input-sha.txt"
+
+mkdir -p "$CONTAINER_CACHE"
+host_uid=$(id -u)
+host_gid=$(id -g)
+
+fix_output_ownership() {
+  local original_status=$?
+  trap - EXIT
+  set +e
+  docker run --rm \
+    -e HOST_UID="$host_uid" -e HOST_GID="$host_gid" \
+    -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
+    -v "$run_root:/results" \
+    -v "$CONTAINER_CACHE:/cache" \
+    "$MEGATRON_IMAGE" \
+    bash -lc '
+      chown -R "$HOST_UID:$HOST_GID" /results /cache
+      if [[ -e /workspace/Megatron-LM/flops_analysis ]]; then
+        chown -R "$HOST_UID:$HOST_GID" /workspace/Megatron-LM/flops_analysis
+      fi
+    '
+  local cleanup_status=$?
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    echo "WARNING: failed to restore artifact/cache ownership." >&2
+  fi
+  exit "$original_status"
+}
+trap fix_output_ownership EXIT
 
 docker run --rm --gpus all \
   --ipc=host \
@@ -116,17 +152,6 @@ docker run --rm --gpus all \
   "$MEGATRON_IMAGE" \
   bash -lc 'python -c "import torch; print(torch.__version__); print(torch.cuda.device_count()); assert torch.cuda.device_count() == 8" && nvidia-smi -L' \
   2>&1 | tee "$run_root/gpu-preflight.log"
-
-docker run --rm \
-  -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
-  -w /workspace/Megatron-LM \
-  "$MEGATRON_IMAGE" \
-  bash -lc 'CUDA_VISIBLE_DEVICES="" uv run pytest --noconftest \
-    tests/unit_tests/test_theoretical_flops_usage.py \
-    tests/unit_tests/test_te_attention_runtime_context.py \
-    tests/unit_tests/test_trace_reconciliation.py \
-    -v' \
-  2>&1 | tee "$run_root/phase-a.log"
 
 run_smoke() {
   local mode="$1"
@@ -139,6 +164,9 @@ run_smoke() {
     --network=host --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT="$master_port" \
+    -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
+    -e TRITON_CACHE_DIR=/root/.cache/triton \
+    -v "$CONTAINER_CACHE:/root/.cache" \
     -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
     -w /workspace/Megatron-LM \
     "$MEGATRON_IMAGE" \
