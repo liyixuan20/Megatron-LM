@@ -23,7 +23,11 @@ readonly MEGATRON_REPO=/home/liyixuan/workspace/Megatron-LM
 readonly MEGATRON_IMAGE=megatron-lm:theoretical-flops-dev
 readonly EXPECTED_BRANCH=codex/theoretical-flops-trace
 
+# shellcheck source=scripts/theoretical_flops_slurm_common.sh
+source "$MEGATRON_REPO/scripts/theoretical_flops_slurm_common.sh"
+
 cd "$MEGATRON_REPO"
+refresh_docker_group_if_needed
 
 echo "hostname=$(hostname)"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
@@ -53,14 +57,7 @@ git show -s --format=fuller "$run_sha" | tee "$prep_root/git-commit.txt"
 squeue -u "$USER" -o "%.18i %.12j %.9P %.8T %.10M %.6D %R" \
   | tee "$prep_root/slurm-allocation.txt"
 
-if ! docker version >/dev/null 2>&1; then
-  echo "Docker is not usable in this job. Diagnostic information follows:" >&2
-  id >&2
-  getent group docker >&2 || true
-  stat -c '%A %U %G %n' /var/run/docker.sock >&2 || true
-  docker version >&2 || true
-  exit 1
-fi
+require_docker
 
 force_image_build=${FORCE_IMAGE_BUILD:-0}
 if [[ "$force_image_build" != "0" && "$force_image_build" != "1" ]]; then
@@ -85,6 +82,8 @@ existing_input_sha=$(
 echo "base image: $megatron_base_image"
 echo "expected image input sha: $image_input_sha"
 echo "existing image input sha: ${existing_input_sha:-missing}"
+
+mkdir -p assets
 
 if [[ "$force_image_build" == "1" || "$existing_input_sha" != "$image_input_sha" ]]; then
   echo "Pulling the base image and building $MEGATRON_IMAGE."
@@ -114,12 +113,14 @@ docker image inspect "$MEGATRON_IMAGE" \
   --format '{{json .RepoDigests}} {{.Id}} {{.Created}} {{index .Config.Labels "org.megatron.build-input-sha"}}' \
   | tee "$prep_root/docker-image.txt"
 
+set_host_user_docker_opts
 docker run --rm \
-  -e PYTHONDONTWRITEBYTECODE=1 \
-  -v "$MEGATRON_REPO:/workspace/Megatron-LM:ro" \
+  "${HOST_USER_DOCKER_OPTS[@]}" \
+  -e CUDA_VISIBLE_DEVICES="" \
+  -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
   -w /workspace/Megatron-LM \
   "$MEGATRON_IMAGE" \
-  bash -lc 'CUDA_VISIBLE_DEVICES="" uv run pytest --noconftest -p no:cacheprovider \
+  -lc 'python -m pytest --noconftest -p no:cacheprovider \
     tests/unit_tests/test_theoretical_flops_usage.py \
     tests/unit_tests/test_te_attention_runtime_context.py \
     tests/unit_tests/test_trace_reconciliation.py \

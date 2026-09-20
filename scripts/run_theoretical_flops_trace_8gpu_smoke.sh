@@ -8,7 +8,7 @@ if [[ "${MODE}" != "m1" && "${MODE}" != "m1m2" ]]; then
   exit 2
 fi
 
-if ! uv run python pretrain_gpt.py --help 2>/dev/null | grep -q -- "--report-theoretical-flops"; then
+if ! python pretrain_gpt.py --help 2>/dev/null | grep -q -- "--report-theoretical-flops"; then
   echo "pretrain_gpt.py --help does not contain --report-theoretical-flops; check the synced commit." >&2
   exit 1
 fi
@@ -31,7 +31,7 @@ if [[ "${MODE}" == "m1m2" ]]; then
   )
 fi
 
-uv run python -m torch.distributed.run \
+python -m torch.distributed.run \
   --nproc-per-node 8 \
   --nnodes 1 \
   --node-rank 0 \

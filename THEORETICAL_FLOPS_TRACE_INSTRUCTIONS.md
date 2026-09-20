@@ -252,27 +252,42 @@ The image only needs rebuilding when `docker/`, `pyproject.toml`, or `uv.lock` c
 Ordinary Python/shell source updates are visible through the bind mount and do not need an
 image rebuild.
 
-For queued operation, use the dedicated 1-GPU preparation job. It builds or reuses the
-node-local image, verifies its build-input fingerprint, and runs Phase A before the 8-GPU
-job becomes eligible:
+For queued operation, **do not use `srun sleep infinity`**. That holder expires
+after `--time` if you go offline. Use `sbatch` so the job waits in the queue
+unattended. SLURM batch processes on JA do not start with the `docker` group;
+the wrappers re-exec under `sg docker`.
+
+Validate that path with a 1-GPU, 10-minute probe (no clean-worktree requirement).
+The image is already on `octave` from the interactive build, so skip the 1-GPU
+prep job unless the image is missing:
 
 ```bash
 cd /home/liyixuan/workspace/Megatron-LM
 mkdir -p logs
+squeue -u "$USER"
+# Cancel leftover flops holder/smoke jobs before submitting a new probe.
+# scancel <jobid>
 
-PREP_JOB_ID=$(sbatch --parsable scripts/prepare_theoretical_flops_image_slurm.slurm)
-RUN_JOB_ID=$(sbatch --parsable \
-  --dependency="afterok:${PREP_JOB_ID}" \
-  scripts/run_theoretical_flops_trace_slurm.slurm)
-
-echo "PREP_JOB_ID=${PREP_JOB_ID}"
-echo "RUN_JOB_ID=${RUN_JOB_ID}"
+PROBE_JOB_ID=$(sbatch --parsable scripts/probe_theoretical_flops_docker_slurm.slurm)
+echo "PROBE_JOB_ID=${PROBE_JOB_ID}"
 ```
 
-Use `--export=ALL,FORCE_IMAGE_BUILD=1` when submitting the preparation job to force a
-rebuild. The 8-GPU job never pulls or builds images: a missing, unlabeled, or stale image
-fails fast and points back to the preparation job. `ALLOW_UNVERIFIED_IMAGE=1` is available
-only as an explicit diagnostic escape hatch and should not be used for acceptance runs.
+When `sacct -j "$PROBE_JOB_ID"` is `COMPLETED` / `0:0` and
+`logs/flops-docker-probe-${PROBE_JOB_ID}.out` contains `DOCKER_PROBE_OK`, submit
+the 8-GPU smoke (worktree must be clean / committed):
+
+```bash
+sbatch scripts/run_theoretical_flops_trace_slurm.slurm
+```
+
+Use `--export=ALL,FORCE_IMAGE_BUILD=1` only when submitting
+`scripts/prepare_theoretical_flops_image_slurm.slurm` to force a rebuild. The
+8-GPU job never pulls or builds images. `ALLOW_UNVERIFIED_IMAGE=1` is a
+diagnostic escape hatch and should not be used for acceptance runs.
+
+`Dockerfile.ci.dev` copies `assets/`; the public clone does not contain that
+directory. The prep script runs `mkdir -p assets` before `docker build`. Do not
+omit `--target main`. Do not increase compiler parallelism.
 
 On `octave`, inside an active allocation:
 
@@ -354,6 +369,7 @@ scripts/run_theoretical_flops_trace_8gpu_smoke.sh
 The queued SLURM wrappers are:
 
 ```text
+scripts/probe_theoretical_flops_docker_slurm.slurm   # 1 GPU, ~2 min: sg docker + image
 scripts/prepare_theoretical_flops_image_slurm.slurm  # 1 GPU: image + Phase A
 scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: Phase C only
 ```
@@ -520,7 +536,7 @@ Use the first real failure, not later cascading NCCL errors.
 
 | Symptom | First checks |
 |---|---|
-| Docker permission denied | Confirm allocation is `R`; open a new `ssh octave`; run `id` and inspect `/var/run/docker.sock` |
+| Docker permission denied | Batch jobs lack the docker group until `sg docker`; check `logs/*.err` for the sg re-exec. Confirm `id` inside the job includes docker after sg. Do not use `srun sleep` holders. |
 | `docker: command not found` | Confirm hostname is `octave`, not `yes` |
 | Image pull/build fails | Preserve build output; check registry/network and disk with `docker system df`; do not prune without review |
 | `uv` or package import mismatch | Confirm image tag and ID; rebuild from `docker/Dockerfile.ci.dev --target main` after lock/dependency changes |
