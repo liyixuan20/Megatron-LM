@@ -1,15 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=flops-dense-8gpu
-#SBATCH --account=long
-#SBATCH --partition=long
-#SBATCH --nodelist=octave
+#SBATCH --account=a100
+#SBATCH --partition=a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:a100:8
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180G
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -20,8 +19,8 @@
 #   sbatch --test-only scripts/run_theoretical_flops_trace_slurm.slurm
 #   sbatch scripts/run_theoretical_flops_trace_slurm.slurm
 #
-# The long partition on JA allows the long and priority accounts. This script
-# uses the long account and pins the allocation to the 8xA100 octave node.
+# The liyixuan user is associated with the a100 account. The JA a100 partition
+# provides the 8xA100 octave node, so an explicit nodelist is unnecessary.
 
 set -euo pipefail
 
