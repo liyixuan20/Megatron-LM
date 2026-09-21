@@ -50,7 +50,6 @@ set_host_user_docker_opts() {
     -e HOME=/tmp
     -e USER="$host_user"
     -e LOGNAME="$host_user"
-    -e TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
     -e PYTHONPATH=/workspace/Megatron-LM
     -e UV_NO_SYNC=1
     -e PYTHONDONTWRITEBYTECODE=1
@@ -59,12 +58,67 @@ set_host_user_docker_opts() {
 
 # Prefer SLURM-visible devices so `docker run --gpus all` cannot leak extra GPUs
 # (job 316935 allocated 1 GPU and still saw device_count==8).
+#
+# Docker/NVIDIA CSV parsing requires inner quotes around a multi-device list:
+#   --gpus '"device=0,1,2,3,4,5,6,7"'
 docker_gpu_args() {
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    DOCKER_GPU_ARGS=(--gpus "device=${CUDA_VISIBLE_DEVICES}")
+    DOCKER_GPU_ARGS=(--gpus "\"device=${CUDA_VISIBLE_DEVICES}\"")
   else
     DOCKER_GPU_ARGS=(--gpus all)
   fi
+}
+
+# Persist compiler caches on the shared host directory that wrappers bind-mount.
+set_container_cache_opts() {
+  local host_cache="${CONTAINER_CACHE:-/home/liyixuan/.cache/megatron-docker}"
+  mkdir -p \
+    "$host_cache/torchinductor" \
+    "$host_cache/torch_extensions" \
+    "$host_cache/triton"
+  CONTAINER_CACHE_DOCKER_OPTS=(
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/megatron-cache/torchinductor
+    -e TORCH_EXTENSIONS_DIR=/tmp/megatron-cache/torch_extensions
+    -e TRITON_CACHE_DIR=/tmp/megatron-cache/triton
+    -v "$host_cache:/tmp/megatron-cache"
+  )
+}
+
+# Forward experiment knobs so `sbatch --export=ALL,NUM_LAYERS=28,...` reaches
+# the inner smoke/nsys script instead of dying at the Docker boundary.
+theoretical_flops_training_env_args() {
+  local keys=(
+    NVTE_DEBUG
+    NVTE_DEBUG_LEVEL
+    THEORETICAL_FLOPS_OUTPUT_DIR
+    NSYS_OUTPUT
+    NPROC_PER_NODE
+    NUM_LAYERS
+    TRAIN_ITERS
+    PROFILE_STEP_START
+    PROFILE_STEP_END
+    PROFILE_RANKS
+    TIMING_LOG_LEVEL
+    TP_SIZE
+    PP_SIZE
+    CP_SIZE
+    HIDDEN_SIZE
+    FFN_HIDDEN_SIZE
+    SEQ_LENGTH
+    MICRO_BATCH_SIZE
+    GLOBAL_BATCH_SIZE
+    NUM_ATTENTION_HEADS
+    NUM_QUERY_GROUPS
+    KV_CHANNELS
+    VOCAB_SIZE
+  )
+  THEORETICAL_FLOPS_TRAINING_ENV_ARGS=()
+  local key
+  for key in "${keys[@]}"; do
+    if [[ -n "${!key+x}" && -n "${!key}" ]]; then
+      THEORETICAL_FLOPS_TRAINING_ENV_ARGS+=(-e "${key}=${!key}")
+    fi
+  done
 }
 
 require_expected_branch() {

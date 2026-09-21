@@ -65,18 +65,32 @@ docker image inspect "$MEGATRON_IMAGE" \
   | tee "$run_root/provenance/docker-image.txt"
 printf '%s\n' "$image_input_sha" | tee "$run_root/provenance/image-input-sha.txt"
 
-mkdir -p "$CONTAINER_CACHE"
+export THEORETICAL_FLOPS_OUTPUT_DIR="${THEORETICAL_FLOPS_OUTPUT_DIR:-./flops_analysis}"
+export NSYS_OUTPUT="${NSYS_OUTPUT:-./flops_analysis/nsys/megatron-dense-gqa}"
+export TRAIN_ITERS="${TRAIN_ITERS:-8}"
+export PROFILE_STEP_START="${PROFILE_STEP_START:-4}"
+export PROFILE_STEP_END="${PROFILE_STEP_END:-5}"
+export PROFILE_RANKS="${PROFILE_RANKS:-0}"
+export TIMING_LOG_LEVEL="${TIMING_LOG_LEVEL:-1}"
+export NUM_LAYERS="${NUM_LAYERS:-4}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+export NVTE_DEBUG="${NVTE_DEBUG:-1}"
+export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
+
 set_host_user_docker_opts
 docker_gpu_args
+set_container_cache_opts
+theoretical_flops_training_env_args
 
 docker run --rm \
   "${DOCKER_GPU_ARGS[@]}" \
   --ipc=host \
   "${HOST_USER_DOCKER_OPTS[@]}" \
+  -e NPROC_PER_NODE="$NPROC_PER_NODE" \
   -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
   -w /workspace/Megatron-LM \
   "$MEGATRON_IMAGE" \
-  -lc 'python -c "import torch; print(torch.__version__); print(torch.cuda.device_count()); assert torch.cuda.device_count() == 8" && (command -v nsys || ls /opt/nvidia/nsight-systems/*/bin/nsys) && (nsys --version || /opt/nvidia/nsight-systems/*/bin/nsys --version)' \
+  -lc 'python -c "import os, torch; print(torch.__version__); print(torch.cuda.device_count()); assert torch.cuda.device_count() == int(os.environ[\"NPROC_PER_NODE\"])" && (command -v nsys || ls /opt/nvidia/nsight-systems/*/bin/nsys) && (nsys --version || /opt/nvidia/nsight-systems/*/bin/nsys --version)' \
   2>&1 | tee "$run_root/logs/nsys-preflight.log"
 
 if ! grep -q -E 'NVIDIA Nsight Systems|nsys version|Product version' \
@@ -94,21 +108,10 @@ docker run --rm \
   --cap-add=SYS_ADMIN \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   "${HOST_USER_DOCKER_OPTS[@]}" \
+  "${CONTAINER_CACHE_DOCKER_OPTS[@]}" \
+  "${THEORETICAL_FLOPS_TRAINING_ENV_ARGS[@]}" \
   -e MASTER_ADDR=127.0.0.1 \
   -e MASTER_PORT="$master_port" \
-  -e TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
-  -e TRITON_CACHE_DIR=/tmp/triton \
-  -e NVTE_DEBUG=1 \
-  -e NVTE_DEBUG_LEVEL=2 \
-  -e THEORETICAL_FLOPS_OUTPUT_DIR=./flops_analysis \
-  -e NSYS_OUTPUT=./flops_analysis/nsys/megatron-dense-gqa \
-  -e TRAIN_ITERS="${TRAIN_ITERS:-8}" \
-  -e PROFILE_STEP_START="${PROFILE_STEP_START:-4}" \
-  -e PROFILE_STEP_END="${PROFILE_STEP_END:-5}" \
-  -e PROFILE_RANKS="${PROFILE_RANKS:-0}" \
-  -e TIMING_LOG_LEVEL="${TIMING_LOG_LEVEL:-1}" \
-  -e NUM_LAYERS="${NUM_LAYERS:-4}" \
-  -v "$CONTAINER_CACHE:/tmp/megatron-cache" \
   -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
   -w /workspace/Megatron-LM \
   "$MEGATRON_IMAGE" \
@@ -118,8 +121,9 @@ status=${PIPESTATUS[0]}
 set -e
 printf '%s\n' "$status" | tee "$run_root/logs/nsys-exit-status.txt"
 
-if [[ -e flops_analysis ]]; then
-  mv flops_analysis "$run_root/artifacts/flops_analysis"
+if [[ -e "$THEORETICAL_FLOPS_OUTPUT_DIR" ]]; then
+  mkdir -p "$run_root/artifacts"
+  mv "$THEORETICAL_FLOPS_OUTPUT_DIR" "$run_root/artifacts/flops_analysis"
 fi
 
 collect_theoretical_flops_metrics "$run_root" --log "$run_root/logs/train.log" \
@@ -143,8 +147,10 @@ theory = json.loads((root / "artifacts/flops_analysis/theoretical_flops.json").r
 backend = json.loads((root / "metrics/te_attention_backend.json").read_text())
 assert theory["computed_total_flops"] == theory["reference_total_flops"]
 assert backend.get("te_selected_backend"), backend
+throughput = json.loads((root / "metrics/throughput.json").read_text())
+assert throughput.get("recommended_throughput_tflops_per_gpu") is not None, throughput
 print("TE backend:", backend.get("te_selected_backend_display") or backend["te_selected_backend"])
-print("throughput:", json.loads((root / "metrics/throughput.json").read_text()).get("recommended_throughput_tflops_per_gpu"))
+print("throughput:", throughput.get("recommended_throughput_tflops_per_gpu"))
 PY
 
 if grep -E -q 'Traceback|CUDA out of memory' "$run_root/logs/train.log"; then

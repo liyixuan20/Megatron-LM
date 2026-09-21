@@ -32,6 +32,9 @@ write_theoretical_flops_json = _THEORETICAL_FLOPS_USAGE.write_theoretical_flops_
 get_torch_profile_dir = _TRACE_RECONCILIATION.get_torch_profile_dir
 parse_chrome_trace_gemm_events = _TRACE_RECONCILIATION.parse_chrome_trace_gemm_events
 reconcile_trace_vs_theory = _TRACE_RECONCILIATION.reconcile_trace_vs_theory
+_is_gemm_event_name = _TRACE_RECONCILIATION._is_gemm_event_name
+_shape_from_te_linear_dims = _TRACE_RECONCILIATION._shape_from_te_linear_dims
+_shapes_match = _TRACE_RECONCILIATION._shapes_match
 
 
 def _make_dense_gqa_args(**overrides):
@@ -150,6 +153,80 @@ def test_trace_reconciliation_te_fusion_unmatched(tmp_path):
     assert fc1_unmatched
     assert fc1_unmatched[0]["hint"] == "may be fused via TE gemm+activation kernel"
     assert result.warnings
+
+
+def test_te_linear_and_layernorm_linear_are_gemm_events():
+    assert _is_gemm_event_name("_Linear")
+    assert _is_gemm_event_name("_LayerNormLinear")
+    assert _is_gemm_event_name("LinearWithGradAccumulationAndAsyncCommunication")
+    assert not _is_gemm_event_name("_LinearBackward")
+    assert not _is_gemm_event_name("_LayerNormLinearBackward")
+
+
+def test_te_linear_input_dims_match_dense_shapes():
+    assert _shape_from_te_linear_dims([[4096, 2, 2048], [2048], [], [4096, 2048], [], []]) == (
+        8192,
+        4096,
+        2048,
+    )
+    assert _shape_from_te_linear_dims([[2048, 2048], [4096, 2, 2048], []]) == (8192, 2048, 2048)
+    assert _shape_from_te_linear_dims([[4096, 2, 2048], [2048], [], [12288, 2048], [], []]) == (
+        8192,
+        12288,
+        2048,
+    )
+    assert _shape_from_te_linear_dims([[2048, 6144], [4096, 2, 6144], []]) == (8192, 2048, 6144)
+    assert _shape_from_te_linear_dims([[4096, 2, 2048], [32000, 2048], [], [], [], [], [], []]) == (
+        8192,
+        32000,
+        2048,
+    )
+
+
+def test_logits_transpose_shapes_match():
+    assert _shapes_match((8192, 32000, 2048), (8192, 2048, 32000), 0.01)
+    assert not _shapes_match((8192, 12288, 2048), (8192, 2048, 6144), 0.01)
+
+
+def test_trace_reconciliation_real_te_linear_events(tmp_path):
+    args = _make_dense_gqa_args(theoretical_flops_output_dir=str(tmp_path))
+    theory_path = write_theoretical_flops_json(build_theoretical_flops_report(args, num_microbatches=1), tmp_path)
+    trace_path = tmp_path / "torch_profile" / "rank-0.json.gz"
+    _write_te_linear_trace(
+        trace_path,
+        [
+            ("_LayerNormLinear", [[4096, 2, 2048], [2048], [], [4096, 2048], [], []]),
+            ("_Linear", [[2048, 2048], [4096, 2, 2048], []]),
+            ("_LayerNormLinear", [[4096, 2, 2048], [2048], [], [12288, 2048], [], []]),
+            ("_Linear", [[2048, 6144], [4096, 2, 6144], []]),
+            ("aten::mm", [[8192, 32000], [32000, 2048]]),
+        ],
+    )
+
+    result = reconcile_trace_vs_theory(args, rank=0, trace_path=trace_path, theoretical_path=theory_path)
+
+    assert result.matched == 5
+    assert result.unmatched_analytical == []
+    operators = {event.name for event in parse_chrome_trace_gemm_events(trace_path)}
+    assert "_Linear" in operators
+    assert "_LayerNormLinear" in operators
+
+
+def _write_te_linear_trace(path, named_input_dims):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    trace_events = []
+    for index, (name, input_dims) in enumerate(named_input_dims):
+        trace_events.append(
+            {
+                "name": name,
+                "ph": "X",
+                "ts": index,
+                "dur": 1,
+                "args": {"Input Dims": input_dims},
+            }
+        )
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump({"traceEvents": trace_events}, f)
 
 
 def _write_mock_trace(path, gemm_shapes):

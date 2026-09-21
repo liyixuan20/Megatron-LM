@@ -178,7 +178,7 @@ The 8-GPU wrapper refuses a dirty worktree; commit before Phase C.
 | Docker probe | `scripts/probe_theoretical_flops_docker_slurm.slurm` | 1 | 10 min | `sg docker`, image present, `import torch` |
 | `--help` debug | `scripts/debug_theoretical_flops_help_slurm.slurm` | 1 | 15 min | argparse flag + real `pretrain_gpt.py --help` stderr |
 | Image + Phase A | `scripts/prepare_theoretical_flops_image_slurm.slurm` | 1 | 60 min | Build/reuse `megatron-lm:theoretical-flops-dev`, CPU pytest |
-| Dense Phase C | `scripts/run_theoretical_flops_trace_slurm.slurm` | **8** | 60 min | `m1` then `m1m2`; never pulls/builds the image |
+| Dense Phase C | `scripts/run_theoretical_flops_trace_slurm.slurm` | **8** | 60 min | default `m1m2` only; never pulls/builds the image |
 | Dense nsys (M4) | `scripts/run_theoretical_flops_trace_nsys_slurm.slurm` | **8** | 60 min | NVTX + nsys; no PyTorch profiler; writes `metrics/` |
 
 ```bash
@@ -414,10 +414,11 @@ The packaged entrypoint is:
 scripts/run_theoretical_flops_trace_8gpu_smoke.sh
 ```
 
-The queued SLURM wrappers are listed in §4.1. Phase C is only:
+The queued SLURM wrappers are listed in §4.1. Phase C default is **m1m2 only**:
 
 ```text
-scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: m1 then m1m2
+scripts/run_theoretical_flops_trace_slurm.slurm      # 8 GPUs: m1m2
+# optional: SMOKE_MODE=both to also run the short M1-only job
 ```
 
 It has two modes:
@@ -425,12 +426,13 @@ It has two modes:
 | Mode | Iterations | Result |
 |---|---:|---|
 | `m1` | 2 | Startup theory report only |
-| `m1m2` | 6 | Theory + rank-0 profiler trace + reconciliation |
+| `m1m2` (default) | 8 | Theory + profiler trace + reconciliation |
 
-The current script profiles rank 0 only, over steps `[2, 4)`. Therefore
-`rank-0.json.gz` is the complete Chrome trace for that profiled rank/window, not a trace
-for all eight ranks. Profiling all ranks would require an explicit script change and much
-more storage; it is not required for the first Dense validation.
+The current script profiles rank 0 only, over step `[4, 5)`. Warmup is steps 1–3;
+steps 5–8 are leftover steady-state samples for throughput. `--log-throughput` and
+`--timing-log-level 1` are on for both modes. `rank-0.json.gz` is the complete Chrome
+trace for that profiled rank/window, not a trace for all eight ranks. Set
+`PROFILE_RANKS="0 1"` to export more ranks.
 
 ### 7.1 Record run identity
 

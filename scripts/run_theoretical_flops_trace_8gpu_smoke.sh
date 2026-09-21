@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-MODE="${1:-m1}"
+MODE="${1:-m1m2}"
 if [[ "${MODE}" != "m1" && "${MODE}" != "m1m2" ]]; then
   echo "Usage: $0 [m1|m1m2]" >&2
   exit 2
@@ -19,20 +19,26 @@ export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
 
 THEORETICAL_FLOPS_OUTPUT_DIR="${THEORETICAL_FLOPS_OUTPUT_DIR:-./flops_analysis}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+TIMING_LOG_LEVEL="${TIMING_LOG_LEVEL:-1}"
 theoretical_flops_dense_pretrain_args
+
+COMMON_LOG_ARGS=(
+  --log-throughput
+  --timing-log-level "${TIMING_LOG_LEVEL}"
+)
 
 PROFILE_ARGS=()
 if [[ "${MODE}" == "m1m2" ]]; then
-  TRAIN_ITERS="${TRAIN_ITERS:-6}"
+  # Warmup 1-3, one active profile step at 4, then leftover steady steps 5-8.
+  TRAIN_ITERS="${TRAIN_ITERS:-8}"
   # shellcheck disable=SC2206
   PROFILE_RANK_ARGS=(${PROFILE_RANKS:-0})
   PROFILE_ARGS=(
-    --log-throughput
     --profile
     --use-pytorch-profiler
     --pytorch-profiler-collect-shapes
-    --profile-step-start "${PROFILE_STEP_START:-2}"
-    --profile-step-end "${PROFILE_STEP_END:-4}"
+    --profile-step-start "${PROFILE_STEP_START:-4}"
+    --profile-step-end "${PROFILE_STEP_END:-5}"
     --profile-ranks "${PROFILE_RANK_ARGS[@]}"
   )
 else
@@ -47,5 +53,6 @@ python -m torch.distributed.run \
   --master-port "${MASTER_PORT:-29500}" \
   pretrain_gpt.py \
   "${THEORETICAL_FLOPS_PRETRAIN_ARGS[@]}" \
+  "${COMMON_LOG_ARGS[@]}" \
   "${PROFILE_ARGS[@]}" \
   --train-iters "${TRAIN_ITERS}"

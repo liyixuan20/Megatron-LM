@@ -138,6 +138,9 @@ def reconcile_trace_vs_theory(
             "trace_estimated_tflops": trace_estimated_flops / 1e12,
             "analytical_total_flops": int(theoretical_payload.get("reference_total_flops", 0)),
             "analytical_total_tflops": int(theoretical_payload.get("reference_total_flops", 0)) / 1e12,
+            "measured_throughput_tflops_per_gpu": getattr(
+                args, "measured_throughput_tflops_per_gpu", None
+            ),
         },
         warnings=warnings,
     )
@@ -212,6 +215,8 @@ def format_reconciliation_summary(result: TraceReconciliationResult) -> str:
             f"    analytical_gemm_tflops:  {budget['analytical_gemm_tflops']:.6f}",
             f"    trace_estimated_tflops:  {budget['trace_estimated_tflops']:.6f}",
             f"    analytical_total_tflops: {budget['analytical_total_tflops']:.6f}",
+            "    measured_throughput_tflops_per_gpu: "
+            f"{budget.get('measured_throughput_tflops_per_gpu')}",
             "### TRACE RECONCILIATION END ###",
         ]
     )
@@ -232,12 +237,18 @@ def _unique_trace_events(events: list[TraceGemmEvent]) -> list[TraceGemmEvent]:
 
 
 def _is_gemm_event_name(name: str) -> bool:
+    if "Backward" in name:
+        return False
+    compact = name.replace(" ", "")
     lower_name = name.lower()
     return (
         "aten::mm" in lower_name
         or "aten::addmm" in lower_name
         or "gemm" in lower_name
         or "groupedgemm" in lower_name
+        or compact in {"_Linear", "_LayerNormLinear"}
+        or compact.endswith("Linear")
+        or "LinearWithGradAccumulation" in compact
     )
 
 
@@ -250,6 +261,9 @@ def _extract_event_mnk_shape(event: dict[str, Any]) -> tuple[int, int, int] | No
     for key in ("Input Dims", "Input Shapes", "input_dims", "input_shapes"):
         if key not in args:
             continue
+        te_shape = _shape_from_te_linear_dims(args[key])
+        if te_shape is not None:
+            return te_shape
         shape = _shape_from_input_dims(args[key])
         if shape is not None:
             return shape
@@ -269,6 +283,43 @@ def _shape_from_direct_mnk(args: dict[str, Any]) -> tuple[int, int, int] | None:
             parsed = _parse_mnk_shape(value)
             if parsed is not None:
                 return parsed
+    return None
+
+
+def _shape_from_te_linear_dims(input_dims: Any) -> tuple[int, int, int] | None:
+    """Infer ``(m, n, k)`` from TE ``_Linear`` / ``_LayerNormLinear`` Input Dims.
+
+    Activations are often ``[seq, micro_batch, hidden]``. Weights are ``[n, k]``
+    or ``[k, n]``. 1-D norm parameters are ignored.
+    """
+
+    if not isinstance(input_dims, list):
+        return None
+    activations: list[list[int]] = []
+    weights: list[tuple[int, int]] = []
+    for dims in input_dims:
+        if not isinstance(dims, list) or not dims:
+            continue
+        try:
+            ints = [int(value) for value in dims]
+        except (TypeError, ValueError):
+            continue
+        if len(ints) >= 3:
+            activations.append(ints)
+        elif len(ints) == 2:
+            weights.append((ints[0], ints[1]))
+    if not activations or not weights:
+        return None
+    activation = activations[0]
+    token_count = 1
+    for size in activation[:-1]:
+        token_count *= size
+    in_features = activation[-1]
+    for out_features, weight_k in weights:
+        if weight_k == in_features:
+            return token_count, out_features, weight_k
+        if out_features == in_features:
+            return token_count, weight_k, out_features
     return None
 
 
@@ -309,9 +360,17 @@ def _shapes_match(
 ) -> bool:
     if analytical_shape is None:
         return False
-    return all(
-        abs(expected - actual) <= max(1, int(expected * tolerance))
-        for expected, actual in zip(analytical_shape, trace_shape)
+    candidates = (
+        analytical_shape,
+        # Logits / some TE GEMMs record (m, k, n) instead of (m, n, k).
+        (analytical_shape[0], analytical_shape[2], analytical_shape[1]),
+    )
+    return any(
+        all(
+            abs(expected - actual) <= max(1, int(expected * tolerance))
+            for expected, actual in zip(candidate, trace_shape)
+        )
+        for candidate in candidates
     )
 
 

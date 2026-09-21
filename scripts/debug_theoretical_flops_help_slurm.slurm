@@ -28,6 +28,7 @@ cd "$MEGATRON_REPO"
 refresh_docker_group_if_needed
 require_docker
 set_host_user_docker_opts
+docker_gpu_args
 
 echo "hostname=$(hostname)"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
@@ -35,7 +36,8 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 id
 date -Is
 
-docker run --rm --gpus all \
+docker run --rm \
+  "${DOCKER_GPU_ARGS[@]}" \
   "${HOST_USER_DOCKER_OPTS[@]}" \
   -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
   -w /workspace/Megatron-LM \

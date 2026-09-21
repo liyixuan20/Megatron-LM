@@ -31,10 +31,15 @@ ITERATION_RE = re.compile(
     r"(?:.*?throughput per GPU \(TFLOP/s/GPU\):\s*([0-9.]+))?",
     re.IGNORECASE,
 )
+TIMER_NAME_RE = (
+    r"forward-backward|forward-compute|backward-compute|all-grads-sync|"
+    r"optimizer-copy-to-main-grad|optimizer-inner-step|optimizer|"
+    r"params-all-gather|layernorm-grads-all-reduce|embedding-grads-all-reduce|"
+    r"forward-recv|forward-send|backward-recv|backward-send"
+)
 TIMER_LINE_RE = re.compile(
-    r"(forward-backward|forward-compute|backward-compute|all-grads-sync|"
-    r"optimizer|params-all-gather|forward-recv|forward-send|"
-    r"backward-recv|backward-send)\s*[:=]\s*([0-9.]+)"
+    rf"(?P<name>{TIMER_NAME_RE})\s*[.\s]*:\s*"
+    rf"(?:\((?P<min>[0-9.]+),\s*(?P<max>[0-9.]+)\)|(?P<value>[0-9.]+))"
 )
 NSYS_NAME_RE = re.compile(r"\.(nsys-rep|qdrep|sqlite)$")
 
@@ -73,14 +78,27 @@ def parse_throughput_from_text(log_text: str) -> list[dict[str, Any]]:
 
 
 def parse_timers_from_text(log_text: str) -> list[dict[str, Any]]:
-    """Extract Megatron timer samples that appear in stdout."""
+    """Extract Megatron timer samples, including minmax ``(min, max)`` lines."""
 
     samples = []
+    current: dict[str, Any] = {}
     for line in log_text.splitlines():
-        matches = TIMER_LINE_RE.findall(line)
-        if not matches:
+        match = TIMER_LINE_RE.search(line)
+        if match is None:
+            if current:
+                samples.append(current)
+                current = {}
             continue
-        samples.append({name: float(value) for name, value in matches})
+        name = match.group("name")
+        if match.group("min") is not None:
+            current[name] = {
+                "min_ms": float(match.group("min")),
+                "max_ms": float(match.group("max")),
+            }
+        else:
+            current[name] = {"value_ms": float(match.group("value"))}
+    if current:
+        samples.append(current)
     return samples
 
 
@@ -120,6 +138,10 @@ def collect_run_artifacts(
     _write_json(metrics_dir / "throughput.json", throughput_payload)
     _write_json(metrics_dir / "te_attention_backend.json", te_backend)
     _write_json(metrics_dir / "timers.json", timer_payload)
+    _patch_reconciliation_throughput(
+        recon_paths,
+        throughput_payload["recommended_throughput_tflops_per_gpu"],
+    )
 
     manifest = {
         "run_root": str(root),
@@ -245,6 +267,19 @@ def _display_backend(selected: str | None, version: str | None) -> str | None:
     if version:
         return f"{selected} ({version})"
     return selected
+
+
+def _patch_reconciliation_throughput(
+    recon_paths: list[Path],
+    measured_throughput: float | None,
+) -> None:
+    if measured_throughput is None:
+        return
+    for path in recon_paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        budget = payload.setdefault("flops_budget", {})
+        budget["measured_throughput_tflops_per_gpu"] = measured_throughput
+        _write_json(path, payload)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
