@@ -16,6 +16,8 @@ The run must produce:
 2. A complete PyTorch Chrome trace for the profiled rank and profile window.
 3. A reconciliation report comparing analytical GEMM shapes with trace GEMM events.
 4. Logs and immutable copies of the above artifacts for simulator validation.
+5. Structured metrics (`throughput`, TE FlashAttention/FusedAttention backend, timers).
+6. Optional nsys report for layer/chunk compute+comm (separate 8-GPU job).
 
 Dense and MoE are separate tracks. Do not add MoE flags to the Dense smoke script.
 
@@ -28,7 +30,10 @@ Dense and MoE are separate tracks. Do not add MoE flags to the Dense smoke scrip
 | 1-GPU Docker probe | Passed | Job `316935`, `DOCKER_PROBE_OK` |
 | 8-GPU Phase C, job `316937` | Failed in 44s | Smoke `--help` preflight; training never started |
 | 1-GPU `--help` debug, job `316981` | Completed | `KeyError: getpwuid(): uid not found: 18107` while importing TE/torch inductor. Container `--user` has no `/etc/passwd` entry. Fix: set `USER`/`LOGNAME` in `scripts/theoretical_flops_slurm_common.sh` |
-| M1/M2 Phase C, 8 A100 | Not run yet | After the `USER` env fix, `sbatch scripts/run_theoretical_flops_trace_slurm.slurm` |
+| M1/M2 Phase C, 8 A100 | Passed as smoke | Job `316986`; Chrome reconciliation coverage is still low |
+| Artifact collector | Implemented | `scripts/collect_theoretical_flops_artifacts.py` writes `metrics/` + `run_manifest.json` |
+| TE FlashAttention backend capture | Code fix landed | Parser now waits for `Selected backend` and records the FA version string |
+| nsys 8-GPU layer/chunk trace | Scripts ready | `scripts/run_theoretical_flops_trace_nsys_slurm.slurm`; not yet run on octave |
 | M3 MLA/MoE/MTP/THD/PP filtering | Not implemented | Start only after Dense Phase C is understood |
 | MoE simulator comparison | Deferred | Simulator-side MoE architecture is not ready |
 
@@ -174,6 +179,7 @@ The 8-GPU wrapper refuses a dirty worktree; commit before Phase C.
 | `--help` debug | `scripts/debug_theoretical_flops_help_slurm.slurm` | 1 | 15 min | argparse flag + real `pretrain_gpt.py --help` stderr |
 | Image + Phase A | `scripts/prepare_theoretical_flops_image_slurm.slurm` | 1 | 60 min | Build/reuse `megatron-lm:theoretical-flops-dev`, CPU pytest |
 | Dense Phase C | `scripts/run_theoretical_flops_trace_slurm.slurm` | **8** | 60 min | `m1` then `m1m2`; never pulls/builds the image |
+| Dense nsys (M4) | `scripts/run_theoretical_flops_trace_nsys_slurm.slurm` | **8** | 60 min | NVTX + nsys; no PyTorch profiler; writes `metrics/` |
 
 ```bash
 cd /home/liyixuan/workspace/Megatron-LM
@@ -199,6 +205,10 @@ echo "DEBUG_JOB_ID=${DEBUG_JOB_ID}"
 #    cancels the 8-GPU job instead of occupying octave after hours of PD.
 sbatch --dependency=afterok:${DEBUG_JOB_ID} \
   scripts/run_theoretical_flops_trace_slurm.slurm
+
+# 5) After Chrome smoke is understood: layer/chunk nsys (do not combine with m1m2)
+# Confirm nsys in the 1-GPU probe output first.
+sbatch scripts/run_theoretical_flops_trace_nsys_slurm.slurm
 ```
 
 `sbatch` without `--dependency` is fine if the 1-GPU jobs already completed
@@ -248,6 +258,9 @@ the artifacts above. Job `316937` was `FAILED` / `1:0` after 44s with no
 | `runs/theoretical-flops/<tag>/m1/theoretical_flops.json` | non-empty |
 | `runs/theoretical-flops/<tag>/m1m2/torch_profile/rank-0.json.gz` | `gzip -t` passes |
 | `runs/theoretical-flops/<tag>/m1m2/reconciliation_rank0.json` | parser succeeded |
+| `runs/theoretical-flops/<tag>/metrics/te_attention_backend.json` | `te_selected_backend` is non-null (expect `FlashAttention` + version on A100) |
+| `runs/theoretical-flops/<tag>/run_manifest.json` | collector finished |
+| `runs/theoretical-flops/<tag>-nsys/artifacts/flops_analysis/nsys/*.nsys-rep` | nsys job produced a report |
 
 ### 4.3 Optional interactive holders (legacy)
 
@@ -527,6 +540,35 @@ The theory is an exact analytical math count for the implemented Dense model for
 is not a hardware counter. The reconciliation combines theory with observed trace shapes,
 which is the intended comparison basis for the simulator.
 
+### 7.5 Artifact collection
+
+After a smoke or nsys job, structured metrics are written by
+`scripts/collect_theoretical_flops_artifacts.py`:
+
+```text
+runs/theoretical-flops/<tag>/
+├── run_manifest.json
+├── metrics/
+│   ├── throughput.json              # per-iter ms and TFLOP/s/GPU
+│   ├── te_attention_backend.json    # FlashAttention / FusedAttention + version
+│   └── timers.json                  # timing_log_level samples, if present
+├── m1/ or m1m2/                     # Chrome smoke
+└── artifacts/flops_analysis/        # nsys job: theory JSON + nsys/*.nsys-rep
+```
+
+Re-run collection on an existing directory without occupying GPUs:
+
+```bash
+python3 scripts/collect_theoretical_flops_artifacts.py \
+  --run-root runs/theoretical-flops/20260921-052755-3daf37427ee0-316986 \
+  --log runs/theoretical-flops/20260921-052755-3daf37427ee0-316986/m1m2.log
+```
+
+`te_attention_backend.json` is the place to confirm which TE attention kernel ran.
+On the A100 smoke, logs showed `Selected backend = FlashAttention (2.7.4.post1)`.
+That version string is now parsed into `te_selected_backend_version` instead of
+being dropped.
+
 ## 8. Finish The Allocation And Report Results
 
 If Phase C was launched with `sbatch`, there is no holder to cancel; the job
@@ -593,11 +635,14 @@ docker system df
 After the first 4-layer Dense `m1m2` run passes:
 
 1. Inspect the trace/reconciliation and fix only demonstrated Dense M1/M2 problems.
-2. Re-run through the same WSL -> fork -> `yes` pull -> `octave` workflow.
-3. Scale the Dense config from 4 to 28 layers in a separate committed script/config
+2. Confirm TE `Selected backend` + FlashAttention version in `metrics/te_attention_backend.json`.
+3. Run the nsys job (`scripts/run_theoretical_flops_trace_nsys_slurm.slurm`) for
+   layer/chunk compute+comm. Do not add nsys flags to the Chrome smoke.
+4. Re-run through the same WSL -> fork -> `yes` pull -> `octave` workflow.
+5. Scale the Dense config from 4 to 28 layers in a separate committed script/config
    change and preserve a new artifact directory.
-4. Compare Megatron theory + trace results with simulator Dense output.
-5. Implement M3 items as separate increments. Add a dedicated MoE script only when the
+6. Compare Megatron theory + trace results with simulator Dense output.
+7. Implement M3 items as separate increments. Add a dedicated MoE script only when the
    simulator MoE architecture is ready.
 
 Do not start M3 merely to unblock the current Dense Phase C run; M3 is not a prerequisite

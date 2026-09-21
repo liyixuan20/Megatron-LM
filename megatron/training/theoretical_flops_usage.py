@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ class TeAttentionRuntimeContext:
     nvte_debug_level: str
     te_available_backends: str | None = None
     te_selected_backend: str | None = None
+    te_selected_backend_version: str | None = None
     te_fused_sub_backend: int | None = None
     capture_step: int | None = None
     git_commit: str | None = None
@@ -81,7 +83,9 @@ class TeAttentionLogCapture(logging.Handler):
         """Return parsed runtime-context updates once TE selection is visible."""
 
         parsed = parse_te_attention_runtime_context("\n".join(self._records))
-        if parsed["te_selected_backend"] is None and parsed["te_available_backends"] is None:
+        # Available-backend lines are emitted first. Finalizing on those alone
+        # freezes te_selected_backend=null and drops the later Selected line.
+        if parsed["te_selected_backend"] is None:
             return None
         parsed["capture_step"] = capture_step
         return parsed
@@ -116,6 +120,7 @@ def parse_te_attention_runtime_context(log_text: str) -> dict[str, Any]:
 
     available = None
     selected = None
+    selected_version = None
     fused_sub_backend = None
     for line in log_text.splitlines():
         if "DotProductAttention" not in line:
@@ -123,15 +128,23 @@ def parse_te_attention_runtime_context(log_text: str) -> dict[str, Any]:
         available_match = re.search(r"Available backends\s*=\s*(.+)$", line)
         if available_match:
             available = available_match.group(1).strip()
-        selected_match = re.search(r"Selected backend\s*=\s*([A-Za-z0-9_]+)", line)
+        selected_match = re.search(
+            r"Selected backend\s*=\s*([A-Za-z0-9_]+)(?:\s*\(([^)]+)\))?",
+            line,
+        )
         if selected_match:
             selected = selected_match.group(1).strip()
+            raw_version = selected_match.group(2)
+            selected_version = raw_version.strip() if raw_version else None
         fused_match = re.search(r"sub-backend\s*([0-9]+)", line)
         if fused_match:
             fused_sub_backend = int(fused_match.group(1))
+    if selected != "FusedAttention":
+        fused_sub_backend = None
     return {
         "te_available_backends": available,
         "te_selected_backend": selected,
+        "te_selected_backend_version": selected_version,
         "te_fused_sub_backend": fused_sub_backend,
     }
 
@@ -341,7 +354,7 @@ def format_theoretical_flops_report(report: TheoreticalFlopsReport, verbose: boo
             f"NVTE_DEBUG_LEVEL={report.runtime_context.nvte_debug_level}",
             "  resolved (first TE forward, rank 0):",
             f"    available: {report.runtime_context.te_available_backends}",
-            f"    selected:  {report.runtime_context.te_selected_backend}",
+            f"    selected:  {_format_selected_te_backend(report.runtime_context)}",
             "### TE ATTENTION BACKEND END ###",
         ]
     )
@@ -566,11 +579,24 @@ def _num_query_groups(args: Any) -> int:
     return int(args.num_attention_heads)
 
 
+def _format_selected_te_backend(runtime_context: TeAttentionRuntimeContext) -> str:
+    selected = runtime_context.te_selected_backend
+    if selected is None:
+        return "unknown"
+    if runtime_context.te_selected_backend_version:
+        selected = f"{selected} ({runtime_context.te_selected_backend_version})"
+    if selected.startswith("FusedAttention") and runtime_context.te_fused_sub_backend is not None:
+        return f"{selected} (sub-backend {runtime_context.te_fused_sub_backend})"
+    return selected
+
+
 def _stringify_arg_value(value: Any) -> str:
-    if hasattr(value, "value"):
-        return str(value.value)
+    if isinstance(value, enum.Enum):
+        return value.name
     if hasattr(value, "name"):
         return str(value.name)
+    if hasattr(value, "value"):
+        return str(value.value)
     return str(value)
 
 

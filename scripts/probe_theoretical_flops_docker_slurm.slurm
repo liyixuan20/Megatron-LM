@@ -47,11 +47,14 @@ if ! docker image inspect "$MEGATRON_IMAGE" >/dev/null 2>&1; then
 fi
 
 set_host_user_docker_opts
-docker run --rm --gpus all --ipc=host \
+docker_gpu_args
+docker run --rm \
+  "${DOCKER_GPU_ARGS[@]}" \
+  --ipc=host \
   "${HOST_USER_DOCKER_OPTS[@]}" \
   -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
   -w /workspace/Megatron-LM \
   "$MEGATRON_IMAGE" \
-  -lc 'python -c "import torch; print(\"torch\", torch.__version__); print(\"cuda_device_count\", torch.cuda.device_count())"'
+  -lc 'python -c "import torch; print(\"torch\", torch.__version__); print(\"cuda_device_count\", torch.cuda.device_count())"; echo "---- nsys ----"; if command -v nsys >/dev/null; then nsys --version; else ls /opt/nvidia/nsight-systems/*/bin/nsys 2>/dev/null || echo NSYS_MISSING; fi'
 
 echo "DOCKER_PROBE_OK"

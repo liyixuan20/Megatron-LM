@@ -120,7 +120,9 @@ printf '%s\n' "$image_input_sha" | tee "$run_root/image-input-sha.txt"
 mkdir -p "$CONTAINER_CACHE"
 set_host_user_docker_opts
 
-docker run --rm --gpus all \
+docker_gpu_args
+docker run --rm \
+  "${DOCKER_GPU_ARGS[@]}" \
   --ipc=host \
   "${HOST_USER_DOCKER_OPTS[@]}" \
   -v "$MEGATRON_REPO:/workspace/Megatron-LM" \
@@ -136,7 +138,8 @@ run_smoke() {
   local status_path="$4"
 
   set +e
-  docker run --rm --gpus all \
+  docker run --rm \
+    "${DOCKER_GPU_ARGS[@]}" \
     --network=host --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     "${HOST_USER_DOCKER_OPTS[@]}" \
@@ -204,9 +207,10 @@ grep -E 'THEORETICAL FLOPS REPORT|TE ATTENTION BACKEND|TRACE RECONCILIATION|Trac
   "$run_root/m1.log" "$run_root/m1m2.log" \
   | tee "$run_root/log-highlights.txt" || true
 
-find "$run_root" -maxdepth 4 -type f -printf '%p\t%s bytes\n' \
-  | sort \
-  | tee "$run_root/artifact-index.txt"
+collect_theoretical_flops_metrics "$run_root" \
+  --log "$run_root/m1.log" \
+  --log "$run_root/m1m2.log" \
+  | tee "$run_root/collect.log"
 
 echo "RUN_ROOT=$run_root"
 du -sh "$run_root"

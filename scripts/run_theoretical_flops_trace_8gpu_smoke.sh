@@ -8,90 +8,44 @@ if [[ "${MODE}" != "m1" && "${MODE}" != "m1m2" ]]; then
   exit 2
 fi
 
-if ! command -v python >/dev/null 2>&1; then
-  echo "python is not on PATH. PATH=${PATH}" >&2
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/theoretical_flops_dense_model.sh
+source "$SCRIPT_DIR/theoretical_flops_dense_model.sh"
 
-# Do not pipe `pretrain_gpt.py --help` into `grep -q` under `set -o pipefail`.
-# Megatron's help text is huge; grep -q exits on the first match and python then
-# dies with SIGPIPE (141), so the old check failed even when the flag existed.
-python - <<'PY'
-import argparse
-import sys
-
-from megatron.training.arguments import add_megatron_arguments
-
-parser = argparse.ArgumentParser(add_help=False)
-add_megatron_arguments(parser)
-flags = {opt for action in parser._actions for opt in action.option_strings}
-if "--report-theoretical-flops" not in flags:
-    sys.stderr.write(
-        "argparse is missing --report-theoretical-flops; check the synced commit.\n"
-    )
-    sys.exit(1)
-print("preflight_ok --report-theoretical-flops")
-PY
+theoretical_flops_preflight_report_flag
 
 export NVTE_DEBUG="${NVTE_DEBUG:-1}"
 export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
 
-TRAIN_ITERS=2
+THEORETICAL_FLOPS_OUTPUT_DIR="${THEORETICAL_FLOPS_OUTPUT_DIR:-./flops_analysis}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+theoretical_flops_dense_pretrain_args
+
 PROFILE_ARGS=()
 if [[ "${MODE}" == "m1m2" ]]; then
-  TRAIN_ITERS=6
+  TRAIN_ITERS="${TRAIN_ITERS:-6}"
+  # shellcheck disable=SC2206
+  PROFILE_RANK_ARGS=(${PROFILE_RANKS:-0})
   PROFILE_ARGS=(
     --log-throughput
     --profile
     --use-pytorch-profiler
     --pytorch-profiler-collect-shapes
-    --profile-step-start 2
-    --profile-step-end 4
-    --profile-ranks 0
+    --profile-step-start "${PROFILE_STEP_START:-2}"
+    --profile-step-end "${PROFILE_STEP_END:-4}"
+    --profile-ranks "${PROFILE_RANK_ARGS[@]}"
   )
+else
+  TRAIN_ITERS="${TRAIN_ITERS:-2}"
 fi
 
 python -m torch.distributed.run \
-  --nproc-per-node 8 \
+  --nproc-per-node "${NPROC_PER_NODE}" \
   --nnodes 1 \
   --node-rank 0 \
   --master-addr "${MASTER_ADDR:-127.0.0.1}" \
   --master-port "${MASTER_PORT:-29500}" \
   pretrain_gpt.py \
-  --use-mcore-models \
-  --transformer-impl transformer_engine \
-  --report-theoretical-flops \
-  --theoretical-flops-output-dir ./flops_analysis \
-  --tensorboard-dir ./flops_analysis/tensorboard \
-  --tensor-model-parallel-size 1 \
-  --pipeline-model-parallel-size 1 \
-  --context-parallel-size 1 \
-  --num-layers 4 \
-  --hidden-size 2048 \
-  --ffn-hidden-size 6144 \
-  --num-attention-heads 16 \
-  --group-query-attention \
-  --num-query-groups 8 \
-  --kv-channels 128 \
-  --seq-length 4096 \
-  --max-position-embeddings 4096 \
-  --position-embedding-type rope \
-  --swiglu \
-  --normalization RMSNorm \
-  --disable-bias-linear \
-  --micro-batch-size 2 \
-  --global-batch-size 16 \
-  --mock-data \
-  --tokenizer-type NullTokenizer \
-  --vocab-size 32000 \
-  --bf16 \
-  --lr 1.0e-4 \
-  --min-lr 1.0e-5 \
-  --lr-decay-style cosine \
-  --weight-decay 0.1 \
-  --clip-grad 1.0 \
-  --log-interval 1 \
-  --eval-interval 1000 \
-  --eval-iters 0 \
+  "${THEORETICAL_FLOPS_PRETRAIN_ARGS[@]}" \
   "${PROFILE_ARGS[@]}" \
   --train-iters "${TRAIN_ITERS}"

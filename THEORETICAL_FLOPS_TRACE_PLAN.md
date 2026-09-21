@@ -494,6 +494,7 @@ class TeAttentionRuntimeContext:
     # Filled after first DotProductAttention forward on rank 0 (parse TE logs):
     te_available_backends: str | None   # e.g. "{FlashAttention=True, FusedAttention=True (sub-backend 1), ...}"
     te_selected_backend: str | None     # e.g. "FlashAttention" | "FusedAttention" | "UnfusedDotProductAttention"
+    te_selected_backend_version: str | None  # e.g. "2.7.4.post1" from TE logs
     te_fused_sub_backend: int | None    # if FusedAttention selected
     capture_step: int | None            # train-loop step when selection was observed (informational)
     git_commit: str | None              # `git rev-parse HEAD` at report time (optional)

@@ -124,6 +124,7 @@ docker run --rm \
     tests/unit_tests/test_theoretical_flops_usage.py \
     tests/unit_tests/test_te_attention_runtime_context.py \
     tests/unit_tests/test_trace_reconciliation.py \
+    tests/unit_tests/test_collect_theoretical_flops_artifacts.py \
     -v' \
   2>&1 | tee "$prep_root/phase-a.log"
 

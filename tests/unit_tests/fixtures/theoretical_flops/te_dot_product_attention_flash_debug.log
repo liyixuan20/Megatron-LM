@@ -1,0 +1,2 @@
+DEBUG:DotProductAttention:Available backends = {FlashAttention=True (2.7.4.post1), FusedAttention=True (sub-backend 1), UnfusedDotProductAttention=True}
+DEBUG:DotProductAttention:Selected backend = FlashAttention (2.7.4.post1).
